@@ -41,7 +41,7 @@ sub usage {
   my $envStr = '$' . join(", \$", @envVars);
 
   die "
-Uninstall an IsaSimple user dataset from the VDI dataset schema and user dataset files directory.
+Uninstall an EDA user dataset from the VDI dataset schema and user dataset files directory.
 
 Usage: uninstall vdi_dataset_id
 
