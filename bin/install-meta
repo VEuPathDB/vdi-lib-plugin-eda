@@ -35,7 +35,9 @@ opendir(my $dh, $propsFileDir) or die "Cannot open directory '$propsFileDir': $!
 my @files = grep { -f "$propsFileDir/$_" && $_ !~ /^\./ } readdir($dh);
 closedir($dh);
 
-validationError("Expected exactly one variable mapping file, found " . scalar(@files))
+exit 0 if scalar(@files) == 0;
+
+validationError("Expected only one variable mapping file, found " . scalar(@files))
   unless scalar(@files) == 1;
 
 my $propsFileName = $files[0];
@@ -147,9 +149,9 @@ Usage: install-meta user_dataset_id meta.json propsfiledir
 Where:
   user_dataset_id:  a VDI user dataset id
   meta.json:        metadata JSON file (currently ignored)
-  propsfiledir:     directory containing exactly one tab-delimited properties file
+  propsfiledir:     directory containing zero or one tab-delimited properties file
 
-Updates the attributegraph file with the display name and description of each variable provided in the properties file.
+Updates the attributegraph file with the display name and description of each variable in the properties file, if provided.
 Ignores meta.json file.
 
 The properties file must be tab-delimited with a header row.
