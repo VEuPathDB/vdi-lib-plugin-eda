@@ -1,3 +1,162 @@
-#!/usr/bin/env bash
+#!/usr/bin/env perl
 
-# DO NOTHING
+use strict;
+use warnings;
+
+use DBI;
+use DBD::Pg;
+
+our $VALIDATION_ERROR_CODE = 99;
+
+# Environment variables needed for database connection
+my @envVars = ('DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASS', 'DB_SCHEMA');
+
+my ($userDatasetId, $metaJsonFile, $propsFileDir) = @ARGV;
+
+usage() unless scalar(@ARGV) == 3;
+
+# Check required environment variables
+for my $envVar (@envVars) {
+  validationError("Missing env variable '$envVar'") unless $ENV{$envVar};
+}
+
+# Connect to PostgreSQL database
+my $dbh = DBI->connect(
+  "dbi:Pg:host=$ENV{DB_HOST};port=$ENV{DB_PORT};dbname=$ENV{DB_NAME}",
+  $ENV{DB_USER},
+  $ENV{DB_PASS},
+  { RaiseError => 1, AutoCommit => 0 }
+) or die "Could not connect to database: " . DBI->errstr;
+
+# Find the single file in propsFileDir
+validationError("Directory '$propsFileDir' does not exist") unless -d $propsFileDir;
+
+opendir(my $dh, $propsFileDir) or die "Cannot open directory '$propsFileDir': $!";
+my @files = grep { -f "$propsFileDir/$_" && $_ !~ /^\./ } readdir($dh);
+closedir($dh);
+
+validationError("Expected exactly one variable mapping file, found " . scalar(@files))
+  unless scalar(@files) == 1;
+
+my $propsFileName = $files[0];
+my $propsFile = "$propsFileDir/$propsFileName";
+
+# Parse the tab-delimited file
+my @properties;
+my %seenVariableIds;  # Track variable_ids to detect duplicates
+open(my $fh, '<', $propsFile) or die "Cannot open file '$propsFile': $!";
+
+my $headerSeen = 0;
+while (my $line = <$fh>) {
+  chomp $line;
+
+  # Skip comments
+  next if $line =~ /^\s*#/;
+
+  # Skip empty lines
+  next if $line =~ /^\s*$/;
+
+  my @fields = split(/\t/, $line);
+
+  # Skip header row
+  unless ($headerSeen) {
+    $headerSeen = 1;
+    next;
+  }
+
+  # Extract first three columns: variable_id, display_name, description
+  my $variableId = $fields[0];
+  my $displayName = $fields[1] // '';
+  my $description = $fields[2] // '';
+
+  validationError("Empty variable ID (column 1) on line $. of file $propsFileName") unless $variableId;
+
+  # Check for duplicate variable_id
+  if (exists $seenVariableIds{$variableId}) {
+    close($fh);
+    validationError("Duplicate variable_id '$variableId' found in file $propsFileName");
+  }
+  $seenVariableIds{$variableId} = 1;
+
+  push @properties, {
+    variable_id => $variableId,
+    display_name => $displayName,
+    description => $description
+  };
+}
+close($fh);
+
+print STDERR "Parsed " . scalar(@properties) . " properties from $propsFile\n";
+
+# Table name is attributegraph_{userDatasetId}
+my $tableName = "$ENV{DB_SCHEMA}.attributegraph_$userDatasetId";
+
+# First, get all existing stable_ids from the table to validate
+my $sql = "SELECT stable_id FROM $tableName";
+my $sth = $dbh->prepare($sql);
+$sth->execute();
+
+my %existingIds;
+while (my ($stableId) = $sth->fetchrow_array()) {
+  $existingIds{$stableId} = 1;
+}
+$sth->finish();
+
+# Validate that all variable_ids exist in the table
+for my $prop (@properties) {
+  my $variableId = $prop->{variable_id};
+  unless (exists $existingIds{$variableId}) {
+    $dbh->disconnect;
+    validationError("variable_id '$variableId' from file $propsFileName not found in data files");
+  }
+}
+
+# Update the table with display_name and definition for each property
+my $updateSql = "UPDATE $tableName SET display_name = ?, definition = ? WHERE stable_id = ?";
+my $updateSth = $dbh->prepare($updateSql);
+
+for my $prop (@properties) {
+  $updateSth->execute(
+    $prop->{display_name},
+    $prop->{description},
+    $prop->{variable_id}
+  );
+}
+$updateSth->finish();
+
+$dbh->commit();
+$dbh->disconnect();
+
+print STDERR "Successfully updated " . scalar(@properties) . " records in $tableName\n";
+
+sub validationError {
+  my ($message) = @_;
+  print "$message\n";
+  exit $VALIDATION_ERROR_CODE;
+;
+}
+
+sub usage {
+  my $envStr = '$' . join(", \$", @envVars);
+
+  die "
+Install metadata for a VDI user dataset.
+
+Usage: install-meta user_dataset_id meta.json propsfiledir
+
+Where:
+  user_dataset_id:  a VDI user dataset id
+  meta.json:        metadata JSON file (currently ignored)
+  propsfiledir:     directory containing exactly one tab-delimited properties file
+
+Updates the attributegraph file with the display name and description of each variable provided in the properties file.
+Ignores meta.json file.
+
+The properties file must be tab-delimited with a header row.
+Comments are indicated by #.
+The first three columns must be: variable_id, display_name, description
+
+Env: $envStr
+
+";
+}
