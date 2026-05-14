@@ -8,8 +8,11 @@ use DBD::Pg;
 use Text::CSV;
 
 our $VALIDATION_ERROR_CODE = 99;
+our $dbh;
 
 my @ENV_VARS = ('DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASS', 'DB_SCHEMA');
+
+END { $dbh->disconnect() if $dbh }
 
 run();
 
@@ -29,30 +32,27 @@ sub run {
   # Nothing to do if no properties file was provided
   exit 0 unless defined $propsFile;
 
-  my $dbh = db_connect();
+  db_connect();
 
-  my $tableName = find_table_name($dbh, $userDatasetId);
+  my $tableName = find_table_name($userDatasetId);
 
   my $props = parse_props_file($propsFile);
 
   print STDERR "Parsed " . scalar(@$props) . " properties from $propsFile\n";
 
-  validate_variables($dbh, $tableName, $props);
-  update_metadata($dbh, $tableName, $props);
-
-  $dbh->disconnect();
+  validate_variables($tableName, $props);
+  update_metadata($tableName, $props);
 }
 
 # ---------------------------------------------------------------------------
 
 sub db_connect {
-  my $dbh = DBI->connect(
+  $dbh = DBI->connect(
     "dbi:Pg:host=$ENV{DB_HOST};port=$ENV{DB_PORT};dbname=$ENV{DB_NAME}",
     $ENV{DB_USER},
     $ENV{DB_PASS},
     { RaiseError => 1, AutoCommit => 0 }
   ) or die "Could not connect to database: " . DBI->errstr;
-  return $dbh;
 }
 
 # ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ sub db_connect {
 # Queries study + entitytypegraph to resolve both abbreviations.
 
 sub find_table_name {
-  my ($dbh, $userDatasetId) = @_;
+  my ($userDatasetId) = @_;
 
   my $schema = $ENV{DB_SCHEMA};
 
@@ -82,15 +82,11 @@ sub find_table_name {
   }
   $sth->finish();
 
-  if (scalar(@rows) == 0) {
-    $dbh->disconnect();
-    validationError("No study/entity found for dataset '$userDatasetId'");
-  }
+  validationError("No study/entity found for dataset '$userDatasetId'")
+    if scalar(@rows) == 0;
 
-  if (scalar(@rows) > 1) {
-    $dbh->disconnect();
-    validationError("Multiple entities found for dataset '$userDatasetId'; multi-entity datasets not yet supported");
-  }
+  validationError("Multiple entities found for dataset '$userDatasetId'; multi-entity datasets not yet supported")
+    if scalar(@rows) > 1;
 
   my ($studyAbbrev, $entityAbbrev) = ($rows[0]->{study_abbrev}, $rows[0]->{entity_abbrev});
   return "$schema.attributegraph_${studyAbbrev}_${entityAbbrev}";
@@ -198,7 +194,7 @@ sub parse_props_file {
 # Validates that every stable_id in $props exists in the attributegraph table.
 
 sub validate_variables {
-  my ($dbh, $tableName, $props) = @_;
+  my ($tableName, $props) = @_;
 
   my $sth = $dbh->prepare("SELECT stable_id FROM $tableName");
   $sth->execute();
@@ -210,10 +206,8 @@ sub validate_variables {
   $sth->finish();
 
   for my $prop (@$props) {
-    unless (exists $existing{$prop->{stable_id}}) {
-      $dbh->disconnect();
-      validationError("variable '$prop->{stable_id}' not found in dataset's data files");
-    }
+    validationError("variable '$prop->{stable_id}' not found in dataset's data files")
+      unless exists $existing{$prop->{stable_id}};
   }
 }
 
@@ -221,7 +215,7 @@ sub validate_variables {
 # Updates display_name and definition for each entry in $props.
 
 sub update_metadata {
-  my ($dbh, $tableName, $props) = @_;
+  my ($tableName, $props) = @_;
 
   my $sth = $dbh->prepare(
     "UPDATE $tableName SET display_name = ?, definition = ? WHERE stable_id = ?"
