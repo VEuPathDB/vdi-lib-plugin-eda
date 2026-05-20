@@ -166,23 +166,23 @@ sub parse_props_file {
     next if join('', @$row) =~ /^\s*$/;
     next if $row->[0] =~ /^\s*#/;
 
-    my $stableId    = $row->[$col_idx->{variable}]    // '';
-    my $displayName = $row->[$col_idx->{label}]       // '';
-    my $definition  = $row->[$col_idx->{definition}]  // '';
+    my $variableName = $row->[$col_idx->{variable}]    // '';
+    my $displayName  = $row->[$col_idx->{label}]       // '';
+    my $definition   = $row->[$col_idx->{definition}]  // '';
 
-    $stableId =~ s/^\s+|\s+$//g;
-    next unless length($stableId);
+    $variableName =~ s/^\s+|\s+$//g;
+    next unless length($variableName);
 
-    if (exists $seen{$stableId}) {
+    if (exists $seen{$variableName}) {
       close($fh);
-      validationError("Duplicate variable '$stableId' in properties file");
+      validationError("Duplicate variable '$variableName' in properties file");
     }
-    $seen{$stableId} = 1;
+    $seen{$variableName} = 1;
 
     push @props, {
-      stable_id    => $stableId,
-      display_name => $displayName,
-      definition   => $definition,
+      variable_name => $variableName,
+      display_name  => $displayName,
+      definition    => $definition,
     };
   }
 
@@ -196,18 +196,16 @@ sub parse_props_file {
 sub validate_variables {
   my ($tableName, $props) = @_;
 
-  my $sth = $dbh->prepare("SELECT stable_id FROM $tableName");
-  $sth->execute();
-
-  my %existing;
-  while (my ($id) = $sth->fetchrow_array()) {
-    $existing{$id} = 1;
-  }
-  $sth->finish();
+  my $sth = $dbh->prepare(
+    "SELECT 1 FROM $tableName WHERE provider_label::jsonb @> jsonb_build_array(?)"
+  );
 
   for my $prop (@$props) {
-    validationError("variable '$prop->{stable_id}' not found in dataset's data files")
-      unless exists $existing{$prop->{stable_id}};
+    $sth->execute($prop->{variable_name});
+    my ($found) = $sth->fetchrow_array();
+    $sth->finish();
+    validationError("variable '$prop->{variable_name}' not found in dataset's data files")
+      unless $found;
   }
 }
 
@@ -218,11 +216,11 @@ sub update_metadata {
   my ($tableName, $props) = @_;
 
   my $sth = $dbh->prepare(
-    "UPDATE $tableName SET display_name = ?, definition = ? WHERE stable_id = ?"
+    "UPDATE $tableName SET display_name = ?, definition = ? WHERE provider_label::jsonb @> jsonb_build_array(?)"
   );
 
   for my $prop (@$props) {
-    $sth->execute($prop->{display_name}, $prop->{definition}, $prop->{stable_id});
+    $sth->execute($prop->{display_name}, $prop->{definition}, $prop->{variable_name});
   }
   $sth->finish();
 
