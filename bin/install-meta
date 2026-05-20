@@ -41,6 +41,7 @@ sub run {
   print STDERR "Parsed " . scalar(@$props) . " properties from $propsFile\n";
 
   validate_variables($tableName, $props);
+  widen_annotation_columns($tableName, $props);
   update_metadata($tableName, $props);
 }
 
@@ -197,7 +198,7 @@ sub validate_variables {
   my ($tableName, $props) = @_;
 
   my $sth = $dbh->prepare(
-    "SELECT 1 FROM $tableName WHERE provider_label::jsonb @> jsonb_build_array(?)"
+    "SELECT 1 FROM $tableName WHERE provider_label::jsonb \\?| ARRAY[?]"
   );
 
   for my $prop (@$props) {
@@ -210,13 +211,50 @@ sub validate_variables {
 }
 
 # ---------------------------------------------------------------------------
+
+sub widen_annotation_columns {
+  my ($tableName, $props) = @_;
+
+  my ($schema, $table) = split(/\./, $tableName, 2);
+
+  my $sth = $dbh->prepare("
+    SELECT column_name, character_maximum_length
+    FROM   information_schema.columns
+    WHERE  table_schema = ? AND table_name = ?
+      AND  column_name IN ('display_name', 'definition')
+  ");
+  $sth->execute($schema, $table);
+
+  my %declared;
+  while (my ($col, $max) = $sth->fetchrow_array()) {
+    $declared{$col} = $max;
+  }
+  $sth->finish();
+
+  my %needed = (display_name => 0, definition => 0);
+  for my $prop (@$props) {
+    for my $col (qw(display_name definition)) {
+      my $len = length($prop->{$col} // '');
+      $needed{$col} = $len if $len > $needed{$col};
+    }
+  }
+
+  for my $col (qw(display_name definition)) {
+    my $current = $declared{$col};
+    next unless defined $current;        # already text/unlimited
+    next unless $needed{$col} > $current;
+    $dbh->do("ALTER TABLE $tableName ALTER COLUMN $col TYPE varchar($needed{$col})");
+  }
+}
+
+# ---------------------------------------------------------------------------
 # Updates display_name and definition for each entry in $props.
 
 sub update_metadata {
   my ($tableName, $props) = @_;
 
   my $sth = $dbh->prepare(
-    "UPDATE $tableName SET display_name = ?, definition = ? WHERE provider_label::jsonb @> jsonb_build_array(?)"
+    "UPDATE $tableName SET display_name = ?, definition = ? WHERE provider_label::jsonb \\?| ARRAY[?]"
   );
 
   for my $prop (@$props) {
