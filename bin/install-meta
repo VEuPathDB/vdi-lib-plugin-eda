@@ -68,8 +68,8 @@ while (my $line = <$fh>) {
 
   # Extract first three columns: variable_id, display_name, description
   my $variableId = $fields[0];
-  my $displayName = $fields[1] // '';
-  my $description = $fields[2] // '';
+  my $displayName = $fields[1] || undef;
+  my $description = $fields[2] || undef;
 
   validationError("Empty variable ID (column 1) on line $. of file $propsFileName") unless $variableId;
 
@@ -90,17 +90,31 @@ close($fh);
 
 print STDERR "Parsed " . scalar(@properties) . " properties from $propsFile\n";
 
-# Table name is attributegraph_{userDatasetId}
-my $tableName = "$ENV{DB_SCHEMA}.attributegraph_$userDatasetId";
+# get study and entity abbrevs, for constructing attributegraph table name
+my $sql = "
+SELECT s.internal_abbrev as study_abbrev, e.internal_abbrev as entity_abbrev, e.stable_id as entity_id
+ FROM $ENV{DB_SCHEMA}.study s,
+      $ENV{DB_SCHEMA}.entitytypegraph e
+ WHERE s.stable_id = e.study_stable_id
+   AND s.user_dataset_id = '$userDatasetId'
+";
+my $sth = $dbh->prepare($sql);
+$sth->execute();
 
-# First, get all existing stable_ids from the table to validate
-my $sql = "SELECT stable_id FROM $tableName";
+my ($studyAbbrev, $entityAbbrev, $entityId) = $sth->fetchrow_array();
+validationError("Found more than one entity for this study") if $sth->fetchrow_array();
+$sth->finish();
+
+my $tableName = "$ENV{DB_SCHEMA}.attributegraph_${studyAbbrev}_$entityAbbrev";
+
+# Get all existing provider_labels from the table to validate
+my $sql = "SELECT provider_label FROM $tableName";
 my $sth = $dbh->prepare($sql);
 $sth->execute();
 
 my %existingIds;
-while (my ($stableId) = $sth->fetchrow_array()) {
-  $existingIds{$stableId} = 1;
+while (my ($providerLabel) = $sth->fetchrow_array()) {
+  $existingIds{$providerLabel} = 1;
 }
 $sth->finish();
 
@@ -113,8 +127,8 @@ for my $prop (@properties) {
   }
 }
 
-# Update the table with display_name and definition for each property
-my $updateSql = "UPDATE $tableName SET display_name = ?, definition = ? WHERE stable_id = ?";
+# Update the study-specific table with display_name and definition for each property
+my $updateSql = "UPDATE $tableName SET display_name = ?, definition = ? WHERE provider_label = ?";
 my $updateSth = $dbh->prepare($updateSql);
 
 for my $prop (@properties) {
@@ -126,6 +140,23 @@ for my $prop (@properties) {
 }
 $updateSth->finish();
 
+# Update the shared Variable table with display_name and definition for each property
+$updateSql = "
+UPDATE $ENV{DB_SCHEMA}.variable SET display_name = ?, definition = ?
+ WHERE provider_label = ?
+  AND dataset_id = '$userDatasetId'
+  AND entity_stable_id = '$entityId'
+";
+my $updateSth = $dbh->prepare($updateSql);
+
+for my $prop (@properties) {
+  $updateSth->execute(
+    $prop->{display_name},
+    $prop->{description},
+    $prop->{variable_id}
+  );
+}
+$updateSth->finish();
 $dbh->commit();
 $dbh->disconnect();
 
