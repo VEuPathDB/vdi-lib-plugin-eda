@@ -5,141 +5,278 @@ use warnings;
 
 use DBI;
 use DBD::Pg;
+use Text::CSV;
 
 our $VALIDATION_ERROR_CODE = 99;
+our $dbh;
 
-# Environment variables needed for database connection
-my @envVars = ('DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASS', 'DB_SCHEMA');
+my @ENV_VARS = ('DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASS', 'DB_SCHEMA');
 
-my ($userDatasetId, $metaJsonFile, $propsFileDir) = @ARGV;
+END { $dbh->disconnect() if $dbh }
 
-usage() unless scalar(@ARGV) == 3;
+run();
 
-# Check required environment variables
-for my $envVar (@envVars) {
-  validationError("Missing env variable '$envVar'") unless $ENV{$envVar};
-}
+# ---------------------------------------------------------------------------
 
-# Connect to PostgreSQL database
-my $dbh = DBI->connect(
-  "dbi:Pg:host=$ENV{DB_HOST};port=$ENV{DB_PORT};dbname=$ENV{DB_NAME}",
-  $ENV{DB_USER},
-  $ENV{DB_PASS},
-  { RaiseError => 1, AutoCommit => 0 }
-) or die "Could not connect to database: " . DBI->errstr;
+sub run {
+  my ($userDatasetId, $metaJsonFile, $propsFileDir) = @ARGV;
 
-# Find the single file in propsFileDir
-validationError("Directory '$propsFileDir' does not exist") unless -d $propsFileDir;
+  usage() unless scalar(@ARGV) == 3;
 
-opendir(my $dh, $propsFileDir) or die "Cannot open directory '$propsFileDir': $!";
-my @files = grep { -f "$propsFileDir/$_" && $_ !~ /^\./ } readdir($dh);
-closedir($dh);
-
-exit 0 if scalar(@files) == 0;
-
-validationError("Expected only one variable mapping file, found " . scalar(@files))
-  unless scalar(@files) == 1;
-
-my $propsFileName = $files[0];
-my $propsFile = "$propsFileDir/$propsFileName";
-
-# Parse the tab-delimited file
-my @properties;
-my %seenVariableIds;  # Track variable_ids to detect duplicates
-open(my $fh, '<', $propsFile) or die "Cannot open file '$propsFile': $!";
-
-my $headerSeen = 0;
-while (my $line = <$fh>) {
-  chomp $line;
-
-  # Skip comments
-  next if $line =~ /^\s*#/;
-
-  # Skip empty lines
-  next if $line =~ /^\s*$/;
-
-  my @fields = split(/\t/, $line);
-
-  # Skip header row
-  unless ($headerSeen) {
-    $headerSeen = 1;
-    next;
+  for my $var (@ENV_VARS) {
+    validationError("Missing env variable '$var'") unless $ENV{$var};
   }
 
-  # Extract first three columns: variable_id, display_name, description
-  my $variableId = $fields[0];
-  my $displayName = $fields[1] // '';
-  my $description = $fields[2] // '';
+  my $propsFile = find_props_file($propsFileDir);
 
-  validationError("Empty variable ID (column 1) on line $. of file $propsFileName") unless $variableId;
+  # Nothing to do if no properties file was provided
+  exit 0 unless defined $propsFile;
 
-  # Check for duplicate variable_id
-  if (exists $seenVariableIds{$variableId}) {
-    close($fh);
-    validationError("Duplicate variable_id '$variableId' found in file $propsFileName");
+  db_connect();
+
+  my $tableName = find_table_name($userDatasetId);
+
+  my $props = parse_props_file($propsFile);
+
+  print STDERR "Parsed " . scalar(@$props) . " properties from $propsFile\n";
+
+  validate_variables($tableName, $props);
+  widen_annotation_columns($tableName, $props);
+  update_metadata($tableName, $props);
+}
+
+# ---------------------------------------------------------------------------
+
+sub db_connect {
+  $dbh = DBI->connect(
+    "dbi:Pg:host=$ENV{DB_HOST};port=$ENV{DB_PORT};dbname=$ENV{DB_NAME}",
+    $ENV{DB_USER},
+    $ENV{DB_PASS},
+    { RaiseError => 1, AutoCommit => 0 }
+  ) or die "Could not connect to database: " . DBI->errstr;
+}
+
+# ---------------------------------------------------------------------------
+# Returns the fully-qualified attributegraph table name for this dataset.
+# Queries study + entitytypegraph to resolve both abbreviations.
+
+sub find_table_name {
+  my ($userDatasetId) = @_;
+
+  my $schema = $ENV{DB_SCHEMA};
+
+  my $sql = "
+    SELECT s.internal_abbrev AS study_abbrev,
+           e.internal_abbrev AS entity_abbrev
+    FROM   $schema.study s
+    JOIN   $schema.entitytypegraph e
+           ON e.study_stable_id = s.stable_id
+    WHERE  s.user_dataset_id = ?
+  ";
+
+  my $sth = $dbh->prepare($sql);
+  $sth->execute($userDatasetId);
+
+  my @rows;
+  while (my $row = $sth->fetchrow_hashref()) {
+    push @rows, $row;
   }
-  $seenVariableIds{$variableId} = 1;
+  $sth->finish();
 
-  push @properties, {
-    variable_id => $variableId,
-    display_name => $displayName,
-    description => $description
-  };
+  validationError("No study/entity found for dataset '$userDatasetId'")
+    if scalar(@rows) == 0;
+
+  validationError("Multiple entities found for dataset '$userDatasetId'; multi-entity datasets not yet supported")
+    if scalar(@rows) > 1;
+
+  my ($studyAbbrev, $entityAbbrev) = ($rows[0]->{study_abbrev}, $rows[0]->{entity_abbrev});
+  return "$schema.attributegraph_${studyAbbrev}_${entityAbbrev}";
 }
-close($fh);
 
-print STDERR "Parsed " . scalar(@properties) . " properties from $propsFile\n";
+# ---------------------------------------------------------------------------
+# Returns the path of the single file in $dir, or undef if the dir is empty.
+# Exits with a validation error if more than one file is present.
 
-# Table name is attributegraph_{userDatasetId}
-my $tableName = "$ENV{DB_SCHEMA}.attributegraph_$userDatasetId";
+sub find_props_file {
+  my ($dir) = @_;
 
-# First, get all existing stable_ids from the table to validate
-my $sql = "SELECT stable_id FROM $tableName";
-my $sth = $dbh->prepare($sql);
-$sth->execute();
+  validationError("Directory '$dir' does not exist") unless -d $dir;
 
-my %existingIds;
-while (my ($stableId) = $sth->fetchrow_array()) {
-  $existingIds{$stableId} = 1;
+  opendir(my $dh, $dir) or die "Cannot open directory '$dir': $!";
+  my @files = grep { -f "$dir/$_" && $_ !~ /^\./ } readdir($dh);
+  closedir($dh);
+
+  return undef if scalar(@files) == 0;
+
+  validationError("Expected only one variable mapping file, found " . scalar(@files))
+    unless scalar(@files) == 1;
+
+  return "$dir/$files[0]";
 }
-$sth->finish();
 
-# Validate that all variable_ids exist in the table
-for my $prop (@properties) {
-  my $variableId = $prop->{variable_id};
-  unless (exists $existingIds{$variableId}) {
-    $dbh->disconnect;
-    validationError("variable_id '$variableId' from file $propsFileName not found in data files");
+# ---------------------------------------------------------------------------
+# Parses the properties file, returning an arrayref of hashrefs with keys
+# stable_id, display_name, definition.
+#
+# Accepts .csv (comma-delimited) or anything else (tab-delimited).
+# Locates columns by header name (variable, label, definition) in any order.
+
+sub parse_props_file {
+  my ($path) = @_;
+
+  my $delim = ($path =~ /\.csv$/i) ? ',' : "\t";
+
+  my $csv = Text::CSV->new({
+    sep_char  => $delim,
+    binary    => 1,
+    auto_diag => 1,
+  });
+
+  open(my $fh, '<:encoding(utf8)', $path) or die "Cannot open '$path': $!";
+
+  # Locate the header row (skip blank lines and comments)
+  my $col_idx;
+  while (my $row = $csv->getline($fh)) {
+    next if join('', @$row) =~ /^\s*$/;        # blank
+    next if $row->[0] =~ /^\s*#/;              # comment
+
+    my %idx;
+    for my $i (0 .. $#$row) {
+      my $name = lc($row->[$i]);
+      $name =~ s/^\s+|\s+$//g;
+      $idx{$name} = $i;
+    }
+
+    for my $required (qw(variable label definition)) {
+      validationError("Properties file '$path' is missing required column '$required'")
+        unless exists $idx{$required};
+    }
+
+    $col_idx = \%idx;
+    last;
   }
+
+  validationError("Properties file '$path' appears to be empty or contains only comments")
+    unless defined $col_idx;
+
+  # Read data rows
+  my @props;
+  my %seen;
+
+  while (my $row = $csv->getline($fh)) {
+    next if join('', @$row) =~ /^\s*$/;
+    next if $row->[0] =~ /^\s*#/;
+
+    my $variableName = $row->[$col_idx->{variable}]    // '';
+    my $displayName  = $row->[$col_idx->{label}]       // '';
+    my $definition   = $row->[$col_idx->{definition}]  // '';
+
+    $variableName =~ s/^\s+|\s+$//g;
+    next unless length($variableName);
+
+    if (exists $seen{$variableName}) {
+      close($fh);
+      validationError("Duplicate variable '$variableName' in properties file");
+    }
+    $seen{$variableName} = 1;
+
+    push @props, {
+      variable_name => $variableName,
+      display_name  => $displayName,
+      definition    => $definition,
+    };
+  }
+
+  close($fh);
+  return \@props;
 }
 
-# Update the table with display_name and definition for each property
-my $updateSql = "UPDATE $tableName SET display_name = ?, definition = ? WHERE stable_id = ?";
-my $updateSth = $dbh->prepare($updateSql);
+# ---------------------------------------------------------------------------
+# Validates that every stable_id in $props exists in the attributegraph table.
 
-for my $prop (@properties) {
-  $updateSth->execute(
-    $prop->{display_name},
-    $prop->{description},
-    $prop->{variable_id}
+sub validate_variables {
+  my ($tableName, $props) = @_;
+
+  my $sth = $dbh->prepare(
+    "SELECT 1 FROM $tableName WHERE provider_label::jsonb \\?| ARRAY[?]"
   );
+
+  for my $prop (@$props) {
+    $sth->execute($prop->{variable_name});
+    my ($found) = $sth->fetchrow_array();
+    $sth->finish();
+    validationError("variable '$prop->{variable_name}' not found in dataset's data files")
+      unless $found;
+  }
 }
-$updateSth->finish();
 
-$dbh->commit();
-$dbh->disconnect();
+# ---------------------------------------------------------------------------
 
-print STDERR "Successfully updated " . scalar(@properties) . " records in $tableName\n";
+sub widen_annotation_columns {
+  my ($tableName, $props) = @_;
+
+  my ($schema, $table) = split(/\./, $tableName, 2);
+
+  my $sth = $dbh->prepare("
+    SELECT column_name, character_maximum_length
+    FROM   information_schema.columns
+    WHERE  table_schema = ? AND table_name = ?
+      AND  column_name IN ('display_name', 'definition')
+  ");
+  $sth->execute($schema, $table);
+
+  my %declared;
+  while (my ($col, $max) = $sth->fetchrow_array()) {
+    $declared{$col} = $max;
+  }
+  $sth->finish();
+
+  my %needed = (display_name => 0, definition => 0);
+  for my $prop (@$props) {
+    for my $col (qw(display_name definition)) {
+      my $len = length($prop->{$col} // '');
+      $needed{$col} = $len if $len > $needed{$col};
+    }
+  }
+
+  for my $col (qw(display_name definition)) {
+    my $current = $declared{$col};
+    next unless defined $current;        # already text/unlimited
+    next unless $needed{$col} > $current;
+    $dbh->do("ALTER TABLE $tableName ALTER COLUMN $col TYPE varchar($needed{$col})");
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Updates display_name and definition for each entry in $props.
+
+sub update_metadata {
+  my ($tableName, $props) = @_;
+
+  my $sth = $dbh->prepare(
+    "UPDATE $tableName SET display_name = ?, definition = ? WHERE provider_label::jsonb \\?| ARRAY[?]"
+  );
+
+  for my $prop (@$props) {
+    $sth->execute($prop->{display_name}, $prop->{definition}, $prop->{variable_name});
+  }
+  $sth->finish();
+
+  $dbh->commit();
+
+  print STDERR "Successfully updated " . scalar(@$props) . " records in $tableName\n";
+}
+
+# ---------------------------------------------------------------------------
 
 sub validationError {
   my ($message) = @_;
   print "$message\n";
   exit $VALIDATION_ERROR_CODE;
-;
 }
 
 sub usage {
-  my $envStr = '$' . join(", \$", @envVars);
+  my $envStr = '$' . join(", \$", @ENV_VARS);
 
   die "
 Install metadata for a VDI user dataset.
@@ -149,14 +286,14 @@ Usage: install-meta user_dataset_id meta.json propsfiledir
 Where:
   user_dataset_id:  a VDI user dataset id
   meta.json:        metadata JSON file (currently ignored)
-  propsfiledir:     directory containing zero or one tab-delimited properties file
+  propsfiledir:     directory containing zero or one variable annotations file
 
-Updates the attributegraph file with the display name and description of each variable in the properties file, if provided.
-Ignores meta.json file.
+The annotations file may be .csv (comma-delimited) or .tsv/.txt (tab-delimited).
+It must have a header row with columns named: variable, label, definition
+Columns may appear in any order. Comments (#) and blank lines are ignored.
 
-The properties file must be tab-delimited with a header row.
-Comments are indicated by #.
-The first three columns must be: variable_id, display_name, description
+Updates the attributegraph table with the label (display_name) and definition
+of each variable listed. Ignores meta.json.
 
 Env: $envStr
 
