@@ -27,22 +27,21 @@ sub run {
     validationError("Missing env variable '$var'") unless $ENV{$var};
   }
 
-  my $propsFile = find_props_file($propsFileDir);
+  my ($propsFilePath) = find_props_file($propsFileDir);
 
   # Nothing to do if no properties file was provided
   exit 0 unless defined $propsFile;
 
   db_connect();
 
-  my $tableName = find_table_name($userDatasetId);
+  my ($tableName, $entityId) = find_table_name($userDatasetId);
 
-  my $props = parse_props_file($propsFile);
+  my ($props, $varNames) = parse_props_file($propsFilePath);
 
-  print STDERR "Parsed " . scalar(@$props) . " properties from $propsFile\n";
+  print STDERR "Parsed " . scalar(@$props) . " properties from $propsFilePath\n";
 
-  validate_variables($tableName, $props);
-  widen_annotation_columns($tableName, $props);
-  update_metadata($tableName, $props);
+  validate_variables($tableName, $props, $varNames);
+  update_metadata($tableName, $props, $userDatasetId, $entityId);
 }
 
 # ---------------------------------------------------------------------------
@@ -67,7 +66,8 @@ sub find_table_name {
 
   my $sql = "
     SELECT s.internal_abbrev AS study_abbrev,
-           e.internal_abbrev AS entity_abbrev
+           e.internal_abbrev AS entity_abbrev,
+           e.stable_id AS entity_id
     FROM   $schema.study s
     JOIN   $schema.entitytypegraph e
            ON e.study_stable_id = s.stable_id
@@ -89,8 +89,8 @@ sub find_table_name {
   validationError("Multiple entities found for dataset '$userDatasetId'; multi-entity datasets not yet supported")
     if scalar(@rows) > 1;
 
-  my ($studyAbbrev, $entityAbbrev) = ($rows[0]->{study_abbrev}, $rows[0]->{entity_abbrev});
-  return "$schema.attributegraph_${studyAbbrev}_${entityAbbrev}";
+  my ($studyAbbrev, $entityAbbrev, $enityId) = ($rows[0]->{study_abbrev}, $rows[0]->{entity_abbrev} $rows[0]->{entity_id});
+  return ("$schema.attributegraph_${studyAbbrev}_${entityAbbrev}", $entityId);
 }
 
 # ---------------------------------------------------------------------------
@@ -100,7 +100,7 @@ sub find_table_name {
 sub find_props_file {
   my ($dir) = @_;
 
-  validationError("Directory '$dir' does not exist") unless -d $dir;
+  validationErrorSub("Directory '$dir' does not exist") unless -d $dir;
 
   opendir(my $dh, $dir) or die "Cannot open directory '$dir': $!";
   my @files = grep { -f "$dir/$_" && $_ !~ /^\./ } readdir($dh);
@@ -108,10 +108,10 @@ sub find_props_file {
 
   return undef if scalar(@files) == 0;
 
-  validationError("Expected only one variable mapping file, found " . scalar(@files))
+  validationErrorSub("Expected only one variable mapping file, found " . scalar(@files))
     unless scalar(@files) == 1;
 
-  return "$dir/$files[0]";
+  return ("$dir/$files[0]", $files[0]);
 }
 
 # ---------------------------------------------------------------------------
@@ -162,14 +162,18 @@ sub parse_props_file {
   # Read data rows
   my @props;
   my %seen;
+  my $count = 0;
 
   while (my $row = $csv->getline($fh)) {
+    $count += 1;
     next if join('', @$row) =~ /^\s*$/;
     next if $row->[0] =~ /^\s*#/;
 
-    my $variableName = $row->[$col_idx->{variable}]    // '';
-    my $displayName  = $row->[$col_idx->{label}]       // '';
-    my $definition   = $row->[$col_idx->{definition}]  // '';
+    my $variableName = $row->[$col_idx->{variable}];
+    my $displayName  = $row->[$col_idx->{label}];
+    my $definition   = $row->[$col_idx->{definition}] || undef;
+
+    validationError("Line $count is missing either the variable or label") unless $variableName && $displayName;
 
     $variableName =~ s/^\s+|\s+$//g;
     next unless length($variableName);
@@ -188,88 +192,82 @@ sub parse_props_file {
   }
 
   close($fh);
-  return \@props;
+  return (\@props, \%seen);
 }
 
 # ---------------------------------------------------------------------------
-# Validates that every stable_id in $props exists in the attributegraph table.
-
+# Validates that db variables and annotation file variables agree.
 sub validate_variables {
-  my ($tableName, $props) = @_;
+  my ($tableName, $props, $varNames) = @_;
 
   my $sth = $dbh->prepare(
-    "SELECT 1 FROM $tableName WHERE provider_label::jsonb \\?| ARRAY[?]"
+    "SELECT provider_label::jsonb ->> 0 as provider_label FROM $tableName"  # get first element of json array
   );
 
-  for my $prop (@$props) {
-    $sth->execute($prop->{variable_name});
-    my ($found) = $sth->fetchrow_array();
-    $sth->finish();
-    validationError("variable '$prop->{variable_name}' not found in dataset's data files")
-      unless $found;
-  }
-}
-
-# ---------------------------------------------------------------------------
-
-sub widen_annotation_columns {
-  my ($tableName, $props) = @_;
-
-  my ($schema, $table) = split(/\./, $tableName, 2);
-
-  my $sth = $dbh->prepare("
-    SELECT column_name, character_maximum_length
-    FROM   information_schema.columns
-    WHERE  table_schema = ? AND table_name = ?
-      AND  column_name IN ('display_name', 'definition')
-  ");
-  $sth->execute($schema, $table);
-
-  my %declared;
-  while (my ($col, $max) = $sth->fetchrow_array()) {
-    $declared{$col} = $max;
+  $sth->execute();
+  my %dbVars;
+  while (my ($providerLabel) = $sth->fetchrow_array()) {
+    $dbVars{$providerLabel) = 1;
   }
   $sth->finish();
 
-  my %needed = (display_name => 0, definition => 0);
-  for my $prop (@$props) {
-    for my $col (qw(display_name definition)) {
-      my $len = length($prop->{$col} // '');
-      $needed{$col} = $len if $len > $needed{$col};
-    }
+  my @missingVars;
+  foreach my $dbVar (keys %dbVars) {
+    push(@missingVars, $dbVar) unless $varNames->{$dbVar};
+  }
+  my @extraVars;
+  foreach my $var (keys %$varNames) {
+    push(@extraVars, $var) unless $dbVars{$var};
   }
 
-  for my $col (qw(display_name definition)) {
-    my $current = $declared{$col};
-    next unless defined $current;        # already text/unlimited
-    next unless $needed{$col} > $current;
-    $dbh->do("ALTER TABLE $tableName ALTER COLUMN $col TYPE varchar($needed{$col})");
-  }
+  my $missingMsg = @missingVars? " Missing variables " . join(', ', @missingVars) . "." : "";
+  my $extraMsg = @missingVars? " Extra variables " . join(', ', @extraVars) . "." : "";
+  validationError($missingMsg . $extraMsg) if $missingMsg or $extraMsg;
+
 }
 
 # ---------------------------------------------------------------------------
 # Updates display_name and definition for each entry in $props.
 
 sub update_metadata {
-  my ($tableName, $props) = @_;
+  my ($tableName, $props, $userDatasetId, $entityId) = @_;
 
+  # update the study-specific attributegraph table
   my $sth = $dbh->prepare(
     "UPDATE $tableName SET display_name = ?, definition = ? WHERE provider_label::jsonb \\?| ARRAY[?]"
   );
 
+  # Update the shared Variable table with display_name and definition for each property
+  my $varSql = "
+UPDATE $ENV{DB_SCHEMA}.variable SET display_name = ?, definition = ?
+ WHERE provider_label = ?
+  AND dataset_id = '$userDatasetId'
+  AND entity_stable_id = '$entityId'
+";
+  my $sth2 = $dbh->prepare($varSql);
+
   for my $prop (@$props) {
     $sth->execute($prop->{display_name}, $prop->{definition}, $prop->{variable_name});
+    $sth2->execute($prop->{display_name}, $prop->{definition}, $prop->{variable_name});
   }
   $sth->finish();
+  $sth2->finish();
 
   $dbh->commit();
 
-  print STDERR "Successfully updated " . scalar(@$props) . " records in $tableName\n";
+  print STDERR "Successfully updated " . scalar(@$props) . " records in $tableName and $ENV{DB_SCHEMA}.variable\n";
 }
 
 # ---------------------------------------------------------------------------
 
 sub validationError {
+  my ($message) = @_;
+
+  my ($propsFilePath,$propsFileName) = find_props_file($propsFileDir);
+  validateErrorSub("Annotation file $propsFileName: " . $message);
+}
+
+sub validationErrorSub {
   my ($message) = @_;
   print "$message\n";
   exit $VALIDATION_ERROR_CODE;
