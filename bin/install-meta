@@ -147,6 +147,8 @@ sub parse_props_file {
     auto_diag => 1,
   });
 
+  validationError("File exceeds the 1M size limit") if -s $path > 1000000;
+
   my $enc = detect_file_encoding($path);
   open(my $fh, "<:encoding($enc)", $path) or die "Cannot open '$path': $!";
 
@@ -164,7 +166,7 @@ sub parse_props_file {
     }
 
     for my $required (qw(variable label definition)) {
-      validationError("Properties file '$path' is missing required column '$required'")
+      validationError("Missing required column '$required'")
         unless exists $idx{$required};
     }
 
@@ -172,7 +174,7 @@ sub parse_props_file {
     last;
   }
 
-  validationError("Properties file '$path' appears to be empty or contains only comments")
+  validationError("Appears to be empty or contains only comments")
     unless defined $col_idx;
 
   # Read data rows
@@ -196,7 +198,7 @@ sub parse_props_file {
 
     if (exists $seen{$variableName}) {
       close($fh);
-      validationError("Duplicate variable '$variableName' in properties file");
+      validationError("Duplicate variable '$variableName'");
     }
     $seen{$variableName} = 1;
 
