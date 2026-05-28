@@ -7,8 +7,6 @@ use DBI;
 use DBD::Pg;
 use Text::CSV;
 
-no warnings 'utf8';
-
 our $VALIDATION_ERROR_CODE = 99;
 our $dbh;
 
@@ -117,6 +115,21 @@ sub find_props_file {
 }
 
 # ---------------------------------------------------------------------------
+# Mirrors study-wrangler's detect_file_encoding() in R: probe for valid UTF-8;
+# if invalid, distinguish Windows-1252 (bytes 0x80-0x9F present, which are
+# printable in that encoding) from ISO-8859-1 (those bytes are control codes).
+
+sub detect_file_encoding {
+  my ($path) = @_;
+  open(my $fh, '<:raw', $path) or die "Cannot open '$path': $!";
+  my $bytes = do { local $/; <$fh> };
+  close($fh);
+  my $test = $bytes;
+  return 'UTF-8' if utf8::decode($test);
+  return ($bytes =~ /[\x80-\x9F]/) ? 'Windows-1252' : 'ISO-8859-1';
+}
+
+# ---------------------------------------------------------------------------
 # Parses the properties file, returning an arrayref of hashrefs with keys
 # stable_id, display_name, definition.
 #
@@ -134,7 +147,10 @@ sub parse_props_file {
     auto_diag => 1,
   });
 
-  open(my $fh, '<:encoding(utf8)', $path) or die "Cannot open '$path': $!";
+  validationError("File exceeds the 1M size limit") if -s $path > 1000000;
+
+  my $enc = detect_file_encoding($path);
+  open(my $fh, "<:encoding($enc)", $path) or die "Cannot open '$path': $!";
 
   # Locate the header row (skip blank lines and comments)
   my $col_idx;
@@ -150,7 +166,7 @@ sub parse_props_file {
     }
 
     for my $required (qw(variable label definition)) {
-      validationError("Properties file '$path' is missing required column '$required'")
+      validationError("Missing required column '$required'")
         unless exists $idx{$required};
     }
 
@@ -158,7 +174,7 @@ sub parse_props_file {
     last;
   }
 
-  validationError("Properties file '$path' appears to be empty or contains only comments")
+  validationError("Appears to be empty or contains only comments")
     unless defined $col_idx;
 
   # Read data rows
@@ -182,7 +198,7 @@ sub parse_props_file {
 
     if (exists $seen{$variableName}) {
       close($fh);
-      validationError("Duplicate variable '$variableName' in properties file");
+      validationError("Duplicate variable '$variableName'");
     }
     $seen{$variableName} = 1;
 
