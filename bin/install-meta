@@ -25,7 +25,7 @@ sub run {
   usage() unless scalar(@ARGV) == 3;
 
   for my $var (@ENV_VARS) {
-    validationErrorSub("Missing env variable '$var'") unless $ENV{$var};
+    die "Missing env variable '$var'" unless $ENV{$var};
   }
 
   my ($propsFilePath) = find_props_file($propsFileDir);
@@ -101,7 +101,7 @@ sub find_table_name {
 sub find_props_file {
   my ($dir) = @_;
 
-  validationErrorSub("Directory '$dir' does not exist") unless -d $dir;
+  die "Directory '$dir' does not exist" unless -d $dir;
 
   opendir(my $dh, $dir) or die "Cannot open directory '$dir': $!";
   my @files = grep { -f "$dir/$_" && $_ !~ /^\./ } readdir($dh);
@@ -109,7 +109,7 @@ sub find_props_file {
 
   return undef if scalar(@files) == 0;
 
-  validationErrorSub("Expected only one variable mapping file, found " . scalar(@files))
+  validationError("Expected only one variable mapping file, found " . scalar(@files))
     unless scalar(@files) == 1;
 
   return ("$dir/$files[0]", $files[0]);
@@ -264,13 +264,7 @@ UPDATE $ENV{DB_SCHEMA}.variable SET display_name = ?, definition = ?
 
 sub validationError {
   my ($message) = @_;
-
-  validationErrorSub("Invalid annotation file: " . $message);
-}
-
-sub validationErrorSub {
-  my ($message) = @_;
-  print "$message\n";
+  print "Invalid annotation file: " . $message\n";
   exit $VALIDATION_ERROR_CODE;
 }
 
