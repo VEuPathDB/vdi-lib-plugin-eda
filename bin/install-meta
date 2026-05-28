@@ -6,7 +6,6 @@ use warnings;
 use DBI;
 use DBD::Pg;
 use Text::CSV;
-use Data::Dumper;
 
 our $VALIDATION_ERROR_CODE = 99;
 our $dbh;
