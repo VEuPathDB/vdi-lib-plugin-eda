@@ -215,11 +215,20 @@ sub parse_props_file {
 
 # ---------------------------------------------------------------------------
 # Validates that db variables and annotation file variables agree.
+#
+# Ignores geoaggregator variables that we generate on import.
 sub validate_variables {
   my ($tableName, $props, $varNames) = @_;
 
   my $sth = $dbh->prepare(
-    "SELECT provider_label::jsonb ->> 0 as provider_label FROM $tableName"  # get first element of json array
+    qq{
+        SELECT
+            provider_label::jsonb ->> 0 AS provider_label
+        FROM
+            $tableName
+        WHERE
+            display_type IS DISTINCT FROM 'geoaggregator'
+    } # get first element of JSON array; allow NULL display_type
   );
 
   $sth->execute();
