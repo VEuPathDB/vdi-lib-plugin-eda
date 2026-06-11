@@ -161,6 +161,7 @@ sub parse_props_file {
     my %idx;
     for my $i (0 .. $#$row) {
       my $name = lc($row->[$i]);
+      $name =~ s/^\x{FEFF}//;   # strip UTF-8 BOM if present on first cell
       $name =~ s/^\s+|\s+$//g;
       $idx{$name} = $i;
     }
