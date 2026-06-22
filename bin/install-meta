@@ -6,6 +6,10 @@ use warnings;
 use DBI;
 use DBD::Pg;
 use Text::CSV;
+use FindBin;
+use File::Basename;
+use lib "$FindBin::Bin/../lib/perl";
+use CopyAndCleanTextFile;
 
 our $VALIDATION_ERROR_CODE = 99;
 our $dbh;
@@ -115,21 +119,6 @@ sub find_props_file {
 }
 
 # ---------------------------------------------------------------------------
-# Mirrors study-wrangler's detect_file_encoding() in R: probe for valid UTF-8;
-# if invalid, distinguish Windows-1252 (bytes 0x80-0x9F present, which are
-# printable in that encoding) from ISO-8859-1 (those bytes are control codes).
-
-sub detect_file_encoding {
-  my ($path) = @_;
-  open(my $fh, '<:raw', $path) or die "Cannot open '$path': $!";
-  my $bytes = do { local $/; <$fh> };
-  close($fh);
-  my $test = $bytes;
-  return 'UTF-8' if utf8::decode($test);
-  return ($bytes =~ /[\x80-\x9F]/) ? 'Windows-1252' : 'ISO-8859-1';
-}
-
-# ---------------------------------------------------------------------------
 # Parses the properties file, returning an arrayref of hashrefs with keys
 # stable_id, display_name, definition.
 #
@@ -149,7 +138,7 @@ sub parse_props_file {
 
   validationError("File exceeds the 1M size limit") if -s $path > 1000000;
 
-  my $enc = detect_file_encoding($path);
+  my $enc = detectFileEncoding($path);
   open(my $fh, "<:encoding($enc)", $path) or die "Cannot open '$path': $!";
 
   # Locate the header row (skip blank lines and comments)
