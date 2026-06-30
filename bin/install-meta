@@ -280,7 +280,7 @@ UPDATE $ENV{DB_SCHEMA}.variable SET display_name = ?, definition = ?
 
 sub validationError {
   my ($message) = @_;
-  print "Invalid annotation file: " . "$message\n";
+  print "Invalid attributes file: " . "$message\n";
   exit $VALIDATION_ERROR_CODE;
 }
 
