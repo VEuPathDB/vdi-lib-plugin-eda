@@ -1,15 +1,17 @@
 #!/usr/bin/perl
 use lib "$ENV{GUS_HOME}/lib/perl";
 use ApiCommonData::Load::InstallEdaStudyFromArtifacts;
+use FindBin;
+use lib "$FindBin::Bin/../lib/perl";
+use VdiPerlUtils;
+use JSON;
 
-# use these for local dev
-#use FindBin;
-#use lib "$FindBin::Bin/../lib/perl";
+# use this for local dev
 #use InstallEdaStudyFromArtifacts;
 
 use strict;
 
-my @envVars = ('DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_PLATFORM', 'DB_USER', 'DB_PASS', 'DB_SCHEMA', 'DATA_FILES');
+my @envVars = ('DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASS', 'DB_SCHEMA', 'DATA_FILES');
 
 my ($userDatasetId, $inputDir) = @ARGV;
 
@@ -20,7 +22,6 @@ for my $envVar (@envVars) { die "Missing env variable '$envVar'\n" unless $ENV{$
 my %requiredVars = ('DB_HOST' => $ENV{DB_HOST},
                     'DB_PORT' => $ENV{DB_PORT},
                     'DB_NAME' => $ENV{DB_NAME},
-                    'DB_PLATFORM' => $ENV{DB_PLATFORM},
                     'DB_USER' => $ENV{DB_USER},
                     'DB_PASS' => $ENV{DB_PASS},
                     'DB_SCHEMA' => $ENV{DB_SCHEMA},
@@ -30,9 +31,15 @@ my %requiredVars = ('DB_HOST' => $ENV{DB_HOST},
 		    'USER_DATASET_ID' => $userDatasetId
     );
 
+my $metadata = getMetadata("$inputDir/vdi-meta.json");
+
+validateRnaseqrc($inputDir) if ($metadata->{type} && $metadata->{type}->{name} eq 'rnaseqrc');
+
 my $installer = ApiCommonData::Load::InstallEdaStudyFromArtifacts->new(\%requiredVars);
 
 $installer->installData();
+
+######################################################################################################
 
 sub usage {
 
@@ -52,4 +59,57 @@ Env: $envStr
 ";
 }
 
+# looks in the attribute graphs file.  expects the last field to be the vocab (gene ids), in the row with VEUPATHDB_GENE_ID
+sub validateRnaseqrc {
+  my ($inputDir) = @_;
+  
+  my @files = glob("$inputDir/attributegraph_*_HTSeqcnts.cache");
+  die "Did not find exactly one attributegraph_*_HTSeqcnts.cache file in '$inputDir'\n" unless @files == 1;
+  my $agFile = $files[0];
+  my $refGenome = getRefGenome("$inputDir/vdi-meta.json");
+  my $refGeneIds = getRefGenomeGeneIds($refGenome);
 
+  open(my $fh, '<', $agFile) or die "Can't open '$agFile': $!\n";
+
+  my @inputGeneIds;
+  while (my $line = <$fh>) {
+    chomp $line;
+    my @fields = split /\t/, $line;
+    next unless grep { $_ eq 'VEUPATHDB_GENE_ID' } @fields;
+    @inputGeneIds = @{ decode_json($fields[-1]) };
+    last;
+  }
+  close($fh);
+
+  die "No VEUPATHDB_GENE_ID line found in '$agFile'\n" unless @inputGeneIds;
+
+  my @notGeneIds;
+  foreach my $inputGene (@inputGeneIds) {
+    push (@notGeneIds, $inputGene) unless $refGeneIds->{$inputGene};
+    last if scalar(@notGeneIds) >= 10;
+  }
+  validationError("HTSeqs count file contains gene IDs that are not currently in our version of '$refGenome'. For example: " . join(', ', @notGeneIds) ) if (scalar(@notGeneIds));
+}
+
+sub  getRefGenomeGeneIds {
+  my ($orgNameForFiles) = @_;
+
+  my $dbh = getDbh();
+
+  my $orgAbbrev = getOrgAbbrev($dbh, $orgNameForFiles);
+
+  my $sql = "select source_id from webready.geneattributes_p where org_abbrev = ?";
+
+  print STDERR "execute query to find gene ids for $orgNameForFiles\n";
+  my $sh = $dbh->prepare($sql);
+  $sh->execute($orgAbbrev);
+
+  my $geneIds = {};
+  while (my ($sourceId) = $sh->fetchrow_array()) {
+    $geneIds->{$sourceId} = 1;
+  }
+  $sh->finish();
+  $dbh->disconnect();
+  
+  return $geneIds;
+}
