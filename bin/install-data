@@ -88,7 +88,7 @@ sub validateRnaseqrc {
     push (@notGeneIds, $inputGene) unless $refGeneIds->{$inputGene};
     last if scalar(@notGeneIds) >= 10;
   }
-  validationError("HTSeqs count file contains gene IDs that are not currently in our version of '$refGenome'. For example: " . join(', ', @notGeneIds) ) if (scalar(@notGeneIds));
+  validationError("The HTSeqs count file contains gene IDs that are not in our current version of the '$refGenome' genome annotation. For example: " . join(', ', @notGeneIds) ) if (scalar(@notGeneIds));
 }
 
 sub  getRefGenomeGeneIds {
